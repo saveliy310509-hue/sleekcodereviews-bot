@@ -186,57 +186,86 @@ def run_webhook_mode(bot: Bot, dp: Dispatcher, config: Config):
     web.run_app(app, host=config.webapp_host, port=config.webapp_port)
 
 
-async def start_cloud_health_server(port: int):
-    app = web.Application()
-    app.router.add_get("/", lambda r: web.Response(text="SleekCode Reviews Bot is running!"))
-    app.router.add_get("/health", lambda r: web.Response(text="OK"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info("Health-check веб-сервер запущен на 0.0.0.0:%s", port)
-    return runner
+LAST_STATUS = "Starting..."
+LAST_ERROR = "No errors"
 
-async def run_polling_mode(bot: Bot, dp: Dispatcher):
-    """Запуск бота в режиме Long Polling с поддержкой Health Check и автопереподключения."""
-    port_str = os.getenv("PORT", "10000")
-    web_runner = None
+async def health_handler(request: web.Request) -> web.Response:
+    """Ответ для Render Health Check"""
+    return web.Response(text=f"Status: {LAST_STATUS}\nError: {LAST_ERROR}\n")
+
+async def run_bot_polling(config: Config):
+    global LAST_STATUS, LAST_ERROR
     try:
-        port = int(port_str)
-        web_runner = await start_cloud_health_server(port)
+        LAST_STATUS = "Initializing components..."
+        bot, dp, db = create_bot_and_dispatcher(config)
+        bot_info = await bot.get_me()
+        logger.info("Бот успешно запущен: @%s (ID: %s)", bot_info.username, bot_info.id)
+        LAST_STATUS = f"Running: @{bot_info.username}"
 
-        # Фоновый Keep-Alive пинг, чтобы бесплатный сервер Render не засыпал
-        ext_url = os.getenv("RENDER_EXTERNAL_URL")
-        if ext_url:
-            async def ping_loop():
-                import aiohttp
-                await asyncio.sleep(60)
-                async with aiohttp.ClientSession() as session:
-                    while True:
-                        try:
-                            async with session.get(ext_url, timeout=10) as resp:
-                                logger.info("Keep-Alive ping %s: %s", ext_url, resp.status)
-                        except Exception:
-                            pass
-                        await asyncio.sleep(600)
-            asyncio.create_task(ping_loop())
-    except Exception as e:
-        logger.warning("Веб-сервер не запущен: %s", e)
-
-    try:
         while True:
             try:
                 await bot.delete_webhook(drop_pending_updates=True)
                 await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
             except Exception as e:
+                import traceback
+                LAST_ERROR = traceback.format_exc()
                 logger.error("Ошибка polling: %s, повтор через 5 секунд...", e)
                 await asyncio.sleep(5)
-    finally:
-        if web_runner:
-            await web_runner.cleanup()
-        if not bot.session.closed:
-            await bot.session.close()
+    except Exception as e:
+        import traceback
+        LAST_ERROR = traceback.format_exc()
+        LAST_STATUS = f"Error: {e}"
+        logger.exception("Критическая ошибка в работе бота:")
 
+async def ping_loop():
+    ext_url = os.getenv("RENDER_EXTERNAL_URL")
+    if not ext_url:
+        return
+    await asyncio.sleep(60)
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(ext_url, timeout=10) as resp:
+                    logger.info("Keep-Alive ping %s: %s", ext_url, resp.status)
+            except Exception:
+                pass
+            await asyncio.sleep(600)
+
+async def async_main():
+    port = int(os.getenv("PORT", "10000"))
+    
+    # 1. Мгновенно поднимаем Health-Check сервер для Render
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/debug", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("Health-check веб-сервер запущен на 0.0.0.0:%s", port)
+
+    # 2. Фоновый Keep-Alive пинг
+    asyncio.create_task(ping_loop())
+
+    # 3. Загрузка конфигурации
+    config = load_config()
+
+    # 4. Запуск бота
+    if config.bot_mode == "webhook":
+        bot, dp, db = create_bot_and_dispatcher(config)
+        run_webhook_mode(bot, dp, config)
+    else:
+        await run_bot_polling(config)
+
+def main():
+    try:
+        asyncio.run(async_main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен пользователем.")
+    except Exception as e:
+        logger.exception("Фатальная ошибка: %s", e)
 
 if __name__ == "__main__":
     main()
