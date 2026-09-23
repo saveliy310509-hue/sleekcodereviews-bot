@@ -188,23 +188,49 @@ def run_webhook_mode(bot: Bot, dp: Dispatcher, config: Config):
 
 LAST_STATUS = "Starting..."
 LAST_ERROR = "No errors"
+bot_instance = None
 
 async def health_handler(request: web.Request) -> web.Response:
     """Ответ для Render Health Check"""
-    return web.Response(text=f"Status: {LAST_STATUS}\nError: {LAST_ERROR}\n")
+    global LAST_STATUS, LAST_ERROR, bot_instance
+    wh_info = "Not connected"
+    if bot_instance:
+        try:
+            wh = await bot_instance.get_webhook_info()
+            wh_info = f"url='{wh.url}', pending={wh.pending_update_count}"
+        except Exception as e:
+            wh_info = f"error checking: {e}"
+    return web.Response(text=f"Status: {LAST_STATUS}\nWebhook: {wh_info}\nError: {LAST_ERROR}\n")
+
+async def webhook_guard(bot: Bot):
+    """Фоновый страж: каждые 30 секунд проверяет, не перехватил ли кто-то вебхук бота.
+    Если перехватил — мгновенно удаляет вебхук, чтобы polling продолжал работать!"""
+    while True:
+        try:
+            info = await bot.get_webhook_info()
+            if info.url:
+                logger.warning(f"⚠️ Обнаружен сторонний вебхук '{info.url}'! Автоматически сбрасываем...")
+                await bot.delete_webhook(drop_pending_updates=False)
+                logger.info("✅ Сторонний вебхук успешно сброшен, polling активен.")
+        except Exception as e:
+            logger.debug(f"Ошибка проверки вебхука: {e}")
+        await asyncio.sleep(30)
 
 async def run_bot_polling(config: Config):
-    global LAST_STATUS, LAST_ERROR
+    global LAST_STATUS, LAST_ERROR, bot_instance
     try:
         LAST_STATUS = "Initializing components..."
         bot, dp, db = create_bot_and_dispatcher(config)
+        bot_instance = bot
         bot_info = await bot.get_me()
         logger.info("Бот успешно запущен: @%s (ID: %s)", bot_info.username, bot_info.id)
         LAST_STATUS = f"Running: @{bot_info.username}"
 
+        asyncio.create_task(webhook_guard(bot))
+
         while True:
             try:
-                await bot.delete_webhook(drop_pending_updates=True)
+                await bot.delete_webhook(drop_pending_updates=False)
                 await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
             except Exception as e:
                 import traceback
